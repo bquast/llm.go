@@ -93,7 +93,14 @@ func forward(pos, token int) int {
 	nHead := 9
 	nKvHead := 3
 
+	// Safety check to prevent context overflow
+	if pos >= 2048 {
+		pos = 2047 
+	}
+
 	x := make([]float32, dim)
+	// Safety bound for vocab
+	if token*dim >= len(embed) { token = 0 }
 	copy(x, embed[token*dim:(token+1)*dim])
 
 	for l := 0; l < 30; l++ {
@@ -110,6 +117,7 @@ func forward(pos, token int) int {
 		xb2 := make([]float32, dim)
 		for h := 0; h < nHead; h++ {
 			kv_h := h / 3
+			// Cache Keys and Values
 			kIdx := l*786432 + 0*393216 + pos*192 + kv_h*64
 			vIdx := l*786432 + 1*393216 + pos*192 + kv_h*64
 			copy(kvCache[kIdx:kIdx+64], k[kv_h*64:(kv_h+1)*64])
@@ -273,7 +281,9 @@ func initModel(this js.Value, args []js.Value) any {
 	revVocab = make(map[int]string)
 	for k, v := range vocab { revVocab[v] = k }
 
-	kvCache = make([]float32, 11796480)
+	// FIX: Double the size to properly hold Keys AND Values for all 30 layers
+	// 30 layers * 2 (K+V) * 2048 max context * 3 heads * 64 head dim = 23592960
+	kvCache = make([]float32, 23592960)
 	isLoaded = true
 
 	return "SmolLM2 Engine Ready. 135M params cleanly mounted."
@@ -290,6 +300,7 @@ func generateText(this js.Value, args []js.Value) any {
 		go func() {
 			if !isLoaded { resolve.Invoke("Error: Model not loaded."); return }
 
+			// Fallback tokenizer matching
 			prompt = strings.ReplaceAll(prompt, " ", "Ġ")
 			tokens := []int{}
 			for len(prompt) > 0 {
@@ -305,9 +316,11 @@ func generateText(this js.Value, args []js.Value) any {
 				prompt = prompt[bestLen:]
 			}
 
+			// Prefill context
 			next := 0
 			for i, t := range tokens { next = forward(i, t) }
 
+			// Generate next tokens
 			for i := len(tokens); i < len(tokens)+20; i++ {
 				word := revVocab[next]
 				word = strings.ReplaceAll(word, "Ġ", " ")
