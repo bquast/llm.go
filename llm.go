@@ -300,44 +300,78 @@ func generateText(this js.Value, args []js.Value) any {
 		go func() {
 			if !isLoaded { resolve.Invoke("Error: Model not loaded."); return }
 
-			// 1. Apply ChatML Instruct Template
-			// SmolLM-Instruct requires this specific formatting to know it's supposed to answer a question.
-			formattedPrompt := fmt.Sprintf("<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt)
-			formattedPrompt = strings.ReplaceAll(formattedPrompt, " ", "Ġ")
+			// SmolLM Special Token IDs
+			imStart := 49152
+			imEnd := 49153
+			newlineToken := 198 // Standard Llama BPE ID for "\n"
 
-			// Tokenize
-			tokens := []int{}
-			for len(formattedPrompt) > 0 {
+			// --- Tokenize the Prompt ---
+			prompt = strings.ReplaceAll(prompt, " ", "Ġ")
+			promptTokens := []int{}
+			for len(prompt) > 0 {
 				bestLen, bestId := 0, 0
 				for word, id := range vocab {
-					if strings.HasPrefix(formattedPrompt, word) && len(word) > bestLen {
+					if strings.HasPrefix(prompt, word) && len(word) > bestLen {
 						bestLen = len(word)
 						bestId = id
 					}
 				}
 				if bestLen == 0 { bestLen = 1 }
-				tokens = append(tokens, bestId)
-				formattedPrompt = formattedPrompt[bestLen:]
+				promptTokens = append(promptTokens, bestId)
+				prompt = prompt[bestLen:]
 			}
 
-			// Prefill context
+			// --- Construct the ChatML sequence using exact integer IDs ---
+			// Template: <|im_start|>user\n {prompt} <|im_end|>\n <|im_start|>assistant\n
+			
+			// Tokenize "user" and "assistant" safely
+			userTokens := []int{}
+			assistantTokens := []int{}
+			for _, id := range vocab {
+				if revVocab[id] == "user" { userTokens = append(userTokens, id) }
+				if revVocab[id] == "assistant" { assistantTokens = append(assistantTokens, id) }
+			}
+			
+			// Assemble final token array
+			tokens := []int{imStart}
+			if len(userTokens) > 0 { tokens = append(tokens, userTokens[0]) }
+			tokens = append(tokens, newlineToken)
+			
+			tokens = append(tokens, promptTokens...)
+			
+			tokens = append(tokens, imEnd)
+			tokens = append(tokens, newlineToken)
+			tokens = append(tokens, imStart)
+			if len(assistantTokens) > 0 { tokens = append(tokens, assistantTokens[0]) }
+			tokens = append(tokens, newlineToken)
+
+			fmt.Printf("Prefilling context with %d tokens...\n", len(tokens))
+
+			// --- Prefill Context ---
 			next := 0
 			for i, t := range tokens { next = forward(i, t) }
 
-			// Generate next tokens
-			for i := len(tokens); i < len(tokens)+100; i++ { // Increased to 100 max tokens
-				word := revVocab[next]
-				
-				// STOP CONDITION: If the model outputs the end token, stop generating!
-				if word == "<|im_end|>" || word == "<|endoftext|>" {
+			// --- Generate Loop ---
+			fmt.Println("Beginning generation...")
+			for i := len(tokens); i < len(tokens)+50; i++ {
+				// DEBUG: Print predicted token ID to console
+				fmt.Printf("Predicted Token ID: %d\n", next)
+
+				// STOP CONDITIONS
+				if next == imEnd || next == 0 || next == 2 {
+					fmt.Println("Hit stop token.")
 					break
 				}
 
-				// Clean formatting for the UI
+				word := revVocab[next]
+				
+				// Format output for HTML
 				word = strings.ReplaceAll(word, "Ġ", " ")
 				word = strings.ReplaceAll(word, "<0x0A>", "\n")
 				
 				js.Global().Call("appendToken", word)
+				
+				// Predict the next token
 				next = forward(i, next)
 			}
 			
