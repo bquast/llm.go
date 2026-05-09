@@ -1,0 +1,51 @@
+name: Build and Deploy llm.go
+
+on:
+  push:
+    branches: ["master"]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-and-deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - name: Build WebAssembly
+        run: |
+          GOOS=js GOARCH=wasm go build -o main.wasm llm.go
+
+      - name: Prepare Site Deployment Folder
+        run: |
+          mkdir _site
+          cp "$(go env GOROOT)/misc/wasm/wasm_exec.js" _site/
+          cp main.wasm _site/
+          cp index.html _site/
+          cp styles.css _site/
+          cp app.js _site/
+
+      - name: Upload GitHub Pages Artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: './_site'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

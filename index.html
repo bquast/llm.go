@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>llm.go | Genesis</title>
+    <link href="https://api.fontshare.com/v2/css?f[]=general-sans@600,500,400&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <nav class="nav">
+        <div class="nav-container">
+            <div class="logo">llm.go</div>
+            <div class="nav-links">
+                <span id="systemStatus" class="chip status-pending">WASM Loading...</span>
+            </div>
+        </div>
+    </nav>
+
+    <main class="container">
+        <header class="header">
+            <h1 class="display-title">SmolLM2 Inference</h1>
+            <p class="subhead">A bare-metal, pure Go LLM implementation running locally in WebAssembly. No server required.</p>
+        </header>
+
+        <section class="card-section">
+            <div class="card chat-card">
+                
+                <!-- Loader State -->
+                <div id="loaderState" class="setup-state">
+                    <div class="setup-content">
+                        <h3>Load Model Weights</h3>
+                        <p>We'll fetch SmolLM2-135M-Instruct (~269MB) directly from HuggingFace and load it into WebAssembly memory. It gets cached for instant reloads.</p>
+                        
+                        <div class="progress-container" id="progressContainer" style="display: none;">
+                            <div class="progress-bar-bg">
+                                <div class="progress-bar-fill" id="progressBar"></div>
+                            </div>
+                            <span id="progressText" class="progress-text">0%</span>
+                        </div>
+
+                        <button id="loadBtn" class="btn btn-primary" disabled>Load Model</button>
+                    </div>
+                </div>
+
+                <!-- Chat State (Hidden initially) -->
+                <div id="chatState" class="chat-state" style="display: none;">
+                    <div class="chat-history" id="chatHistory">
+                        <div class="message system">
+                            <span class="chip">System</span>
+                            <p>Model safely loaded in memory. Inference ready.</p>
+                        </div>
+                    </div>
+                    <div class="input-area">
+                        <div class="input-wrapper">
+                            <textarea id="promptInput" placeholder="Enter a prompt for SmolLM2..." rows="1"></textarea>
+                            <button id="generateBtn" class="btn btn-primary">Generate</button>
+                        </div>
+                    </div>
+                </div>
+
+            </div>
+        </section>
+    </main>
+
+    <script src="wasm_exec.js"></script>
+    <script src="app.js"></script>
+</body>
+</html>
