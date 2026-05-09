@@ -300,20 +300,24 @@ func generateText(this js.Value, args []js.Value) any {
 		go func() {
 			if !isLoaded { resolve.Invoke("Error: Model not loaded."); return }
 
-			// Fallback tokenizer matching
-			prompt = strings.ReplaceAll(prompt, " ", "Ġ")
+			// 1. Apply ChatML Instruct Template
+			// SmolLM-Instruct requires this specific formatting to know it's supposed to answer a question.
+			formattedPrompt := fmt.Sprintf("<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n", prompt)
+			formattedPrompt = strings.ReplaceAll(formattedPrompt, " ", "Ġ")
+
+			// Tokenize
 			tokens := []int{}
-			for len(prompt) > 0 {
+			for len(formattedPrompt) > 0 {
 				bestLen, bestId := 0, 0
 				for word, id := range vocab {
-					if strings.HasPrefix(prompt, word) && len(word) > bestLen {
+					if strings.HasPrefix(formattedPrompt, word) && len(word) > bestLen {
 						bestLen = len(word)
 						bestId = id
 					}
 				}
 				if bestLen == 0 { bestLen = 1 }
 				tokens = append(tokens, bestId)
-				prompt = prompt[bestLen:]
+				formattedPrompt = formattedPrompt[bestLen:]
 			}
 
 			// Prefill context
@@ -321,14 +325,22 @@ func generateText(this js.Value, args []js.Value) any {
 			for i, t := range tokens { next = forward(i, t) }
 
 			// Generate next tokens
-			for i := len(tokens); i < len(tokens)+20; i++ {
+			for i := len(tokens); i < len(tokens)+100; i++ { // Increased to 100 max tokens
 				word := revVocab[next]
+				
+				// STOP CONDITION: If the model outputs the end token, stop generating!
+				if word == "<|im_end|>" || word == "<|endoftext|>" {
+					break
+				}
+
+				// Clean formatting for the UI
 				word = strings.ReplaceAll(word, "Ġ", " ")
-				word = strings.ReplaceAll(word, "<|im_end|>", "\n")
+				word = strings.ReplaceAll(word, "<0x0A>", "\n")
 				
 				js.Global().Call("appendToken", word)
 				next = forward(i, next)
 			}
+			
 			resolve.Invoke("")
 		}()
 		return nil
