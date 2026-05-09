@@ -300,12 +300,14 @@ func generateText(this js.Value, args []js.Value) any {
 		go func() {
 			if !isLoaded { resolve.Invoke("Error: Model not loaded."); return }
 
-			// SmolLM Special Token IDs
+			// SmolLM BPE IDs for ChatML formatting
 			imStart := 49152
 			imEnd := 49153
-			newlineToken := 198 // Standard Llama BPE ID for "\n"
+			newline := 198
+			userWord := 4682      // "user"
+			assistantWord := 78191 // "assistant"
 
-			// --- Tokenize the Prompt ---
+			// --- 1. Tokenize the Prompt String ---
 			prompt = strings.ReplaceAll(prompt, " ", "Ġ")
 			promptTokens := []int{}
 			for len(prompt) > 0 {
@@ -316,62 +318,48 @@ func generateText(this js.Value, args []js.Value) any {
 						bestId = id
 					}
 				}
-				if bestLen == 0 { bestLen = 1 }
-				promptTokens = append(promptTokens, bestId)
+				if bestLen == 0 {
+					bestLen = 1 // Skip unknown characters
+				} else {
+					promptTokens = append(promptTokens, bestId)
+				}
 				prompt = prompt[bestLen:]
 			}
 
-			// --- Construct the ChatML sequence using exact integer IDs ---
-			// Template: <|im_start|>user\n {prompt} <|im_end|>\n <|im_start|>assistant\n
+			// --- 2. Construct the ChatML sequence ---
+			// <|im_start|> user \n
+			tokens := []int{imStart, userWord, newline}
 			
-			// Tokenize "user" and "assistant" safely
-			userTokens := []int{}
-			assistantTokens := []int{}
-			for _, id := range vocab {
-				if revVocab[id] == "user" { userTokens = append(userTokens, id) }
-				if revVocab[id] == "assistant" { assistantTokens = append(assistantTokens, id) }
-			}
-			
-			// Assemble final token array
-			tokens := []int{imStart}
-			if len(userTokens) > 0 { tokens = append(tokens, userTokens[0]) }
-			tokens = append(tokens, newlineToken)
-			
+			// [prompt]
 			tokens = append(tokens, promptTokens...)
 			
-			tokens = append(tokens, imEnd)
-			tokens = append(tokens, newlineToken)
-			tokens = append(tokens, imStart)
-			if len(assistantTokens) > 0 { tokens = append(tokens, assistantTokens[0]) }
-			tokens = append(tokens, newlineToken)
+			// <|im_end|> \n <|im_start|> assistant \n
+			tokens = append(tokens, imEnd, newline, imStart, assistantWord, newline)
 
-			fmt.Printf("Prefilling context with %d tokens...\n", len(tokens))
+			fmt.Printf("Prefilling context with %d exact ChatML tokens...\n", len(tokens))
 
-			// --- Prefill Context ---
+			// --- 3. Prefill Context into the Neural Network ---
 			next := 0
 			for i, t := range tokens { next = forward(i, t) }
 
-			// --- Generate Loop ---
+			// --- 4. Generate Auto-Regressive Loop ---
 			fmt.Println("Beginning generation...")
-			for i := len(tokens); i < len(tokens)+50; i++ {
-				// DEBUG: Print predicted token ID to console
-				fmt.Printf("Predicted Token ID: %d\n", next)
-
-				// STOP CONDITIONS
-				if next == imEnd || next == 0 || next == 2 {
+			for i := len(tokens); i < len(tokens)+100; i++ {
+				// Stop if model outputs End Token or hits vocab boundary
+				if next == imEnd || next == 0 || next == 2 || next == 49152 {
 					fmt.Println("Hit stop token.")
 					break
 				}
 
 				word := revVocab[next]
 				
-				// Format output for HTML
+				// Clean the BPE formatting for the HTML UI
 				word = strings.ReplaceAll(word, "Ġ", " ")
+				word = strings.ReplaceAll(word, "Ċ", "\n")
 				word = strings.ReplaceAll(word, "<0x0A>", "\n")
 				
 				js.Global().Call("appendToken", word)
 				
-				// Predict the next token
 				next = forward(i, next)
 			}
 			
