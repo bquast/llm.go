@@ -12,7 +12,6 @@ import (
 	"syscall/js"
 )
 
-// Tensor Mapping
 type TensorInfo struct {
 	DataOffsets []uint64 `json:"data_offsets"`
 }
@@ -27,20 +26,17 @@ var (
 	modelWeights []byte
 	tensors      map[string]TensorInfo
 	
-	// Model Architecture
 	embed, norm_f, lm_head []float32
 	layers                 []LlamaLayer
-	kvCache                []float32 // Size: 30 * 2 * 2048 * 3 * 64 = 11,796,480 floats
+	kvCache                []float32
 	
-	// Tokenizer
 	vocab    map[string]int
 	revVocab map[int]string
 	isLoaded bool
 )
 
-// ----- NEURAL NETWORK MATH OPS -----
+// --- Math OPs ---
 
-// rmsnorm computes Root Mean Square Normalization
 func rmsnorm(out, x, weight []float32) {
 	dim := len(x)
 	var ss float32
@@ -51,7 +47,6 @@ func rmsnorm(out, x, weight []float32) {
 	for i := 0; i < dim; i++ { out[i] = weight[i] * (ss * x[i]) }
 }
 
-// matmul performs Vector-Matrix Multiplication (y = Wx)
 func matmul(out, x, w []float32) {
 	d_out := len(out)
 	d_in := len(x)
@@ -63,7 +58,6 @@ func matmul(out, x, w []float32) {
 	}
 }
 
-// applyRoPE computes Rotary Positional Embeddings for Q and K
 func applyRoPE(q, k []float32, pos, nHead, nKvHead, headDim int) {
 	for i := 0; i < headDim; i += 2 {
 		freq := 1.0 / math.Pow(10000.0, float64(i)/float64(headDim))
@@ -83,7 +77,6 @@ func applyRoPE(q, k []float32, pos, nHead, nKvHead, headDim int) {
 	}
 }
 
-// swiglu computes the SwiGLU activation function
 func swiglu(out, gate, up []float32) {
 	for i := 0; i < len(out); i++ {
 		x := gate[i]
@@ -92,47 +85,36 @@ func swiglu(out, gate, up []float32) {
 	}
 }
 
-// ----- THE FORWARD PASS -----
+// --- Forward Pass ---
 
-// forward runs a single token through all 30 LLaMA layers
 func forward(pos, token int) int {
 	dim := 576
 	headDim := 64
 	nHead := 9
 	nKvHead := 3
 
-	// 1. Embed Token
 	x := make([]float32, dim)
 	copy(x, embed[token*dim:(token+1)*dim])
 
 	for l := 0; l < 30; l++ {
-		// RMSNorm
 		xb := make([]float32, dim)
 		rmsnorm(xb, x, layers[l].norm1)
 
-		// QKV Projections
-		q := make([]float32, dim)
-		k := make([]float32, 192)
-		v := make([]float32, 192)
+		q, k, v := make([]float32, dim), make([]float32, 192), make([]float32, 192)
 		matmul(q, xb, layers[l].wq)
 		matmul(k, xb, layers[l].wk)
 		matmul(v, xb, layers[l].wv)
 
-		// RoPE
 		applyRoPE(q, k, pos, nHead, nKvHead, headDim)
 
-		// Grouped Query Attention (GQA)
 		xb2 := make([]float32, dim)
 		for h := 0; h < nHead; h++ {
 			kv_h := h / 3
-			
-			// Store K & V in cache
 			kIdx := l*786432 + 0*393216 + pos*192 + kv_h*64
 			vIdx := l*786432 + 1*393216 + pos*192 + kv_h*64
 			copy(kvCache[kIdx:kIdx+64], k[kv_h*64:(kv_h+1)*64])
 			copy(kvCache[vIdx:vIdx+64], v[kv_h*64:(kv_h+1)*64])
 
-			// Q @ K^T
 			scores := make([]float32, pos+1)
 			scale := float32(1.0 / math.Sqrt(64.0))
 			qh := q[h*64 : (h+1)*64]
@@ -143,7 +125,6 @@ func forward(pos, token int) int {
 				scores[t] = s * scale
 			}
 
-			// Softmax
 			maxS := scores[0]
 			for t := 1; t <= pos; t++ { if scores[t] > maxS { maxS = scores[t] } }
 			var sumS float32
@@ -153,7 +134,6 @@ func forward(pos, token int) int {
 			}
 			for t := 0; t <= pos; t++ { scores[t] /= sumS }
 
-			// Score @ V
 			out_h := xb2[h*64 : (h+1)*64]
 			for t := 0; t <= pos; t++ {
 				vh := kvCache[l*786432 + 393216 + t*192 + kv_h*64 : l*786432 + 393216 + t*192 + kv_h*64 + 64]
@@ -161,11 +141,9 @@ func forward(pos, token int) int {
 			}
 		}
 
-		// Output Projection
 		matmul(xb, xb2, layers[l].wo)
-		for i := 0; i < dim; i++ { x[i] += xb[i] } // Residual
+		for i := 0; i < dim; i++ { x[i] += xb[i] }
 
-		// FFN (SwiGLU)
 		rmsnorm(xb, x, layers[l].norm2)
 		gate, up := make([]float32, 1536), make([]float32, 1536)
 		matmul(gate, xb, layers[l].gate)
@@ -174,15 +152,13 @@ func forward(pos, token int) int {
 
 		down := make([]float32, dim)
 		matmul(down, gate, layers[l].down)
-		for i := 0; i < dim; i++ { x[i] += down[i] } // Residual
+		for i := 0; i < dim; i++ { x[i] += down[i] }
 	}
 
-	// Final Norm & Classifier
 	rmsnorm(x, x, norm_f)
 	logits := make([]float32, 49152)
 	matmul(logits, x, lm_head)
 
-	// Argmax (Greedy Sampling)
 	best := 0
 	maxVal := float32(-1e9)
 	for i, val := range logits {
@@ -194,18 +170,34 @@ func forward(pos, token int) int {
 	return best
 }
 
-// ----- MEMORY SETUP -----
+// --- Safetensors Loading ---
 
-func getF32(key string) []float32 {
-	t := tensors[key]
-	data := modelWeights[t.DataOffsets[0]:t.DataOffsets[1]]
+// safeGetF32 handles missing tensors gracefully and converts bfloat16 to float32
+func safeGetF32(key string) ([]float32, error) {
+	t, ok := tensors[key]
+	if !ok {
+		return nil, fmt.Errorf("Missing tensor: %s", key)
+	}
+	if len(t.DataOffsets) < 2 {
+		return nil, fmt.Errorf("Corrupted offset for: %s", key)
+	}
+	
+	start, end := t.DataOffsets[0], t.DataOffsets[1]
+	if start >= uint64(len(modelWeights)) || end > uint64(len(modelWeights)) {
+		return nil, fmt.Errorf("OOB offset for: %s", key)
+	}
+
+	data := modelWeights[start:end]
 	f := make([]float32, len(data)/2)
-	// BFloat16 to Float32 extraction
+	
+	// Convert little-endian bfloat16 bytes to Go float32
 	for i := 0; i < len(f); i++ {
-		u := uint32(data[i*2])<<16 | uint32(data[i*2+1])<<24
+		b0 := uint32(data[i*2])
+		b1 := uint32(data[i*2+1])
+		u := (b1 << 24) | (b0 << 16)
 		f[i] = math.Float32frombits(u)
 	}
-	return f
+	return f, nil
 }
 
 func initModel(this js.Value, args []js.Value) any {
@@ -215,10 +207,12 @@ func initModel(this js.Value, args []js.Value) any {
 	modelWeights = make([]byte, length)
 	js.CopyBytesToGo(modelWeights, jsBuffer)
 
-	// Parse Safetensors Header
 	headerSize := binary.LittleEndian.Uint64(modelWeights[:8])
 	var rawHeader map[string]json.RawMessage
-	json.Unmarshal(modelWeights[8:8+headerSize], &rawHeader)
+	err := json.Unmarshal(modelWeights[8:8+headerSize], &rawHeader)
+	if err != nil {
+		return fmt.Sprintf("Header JSON parse error: %v", err)
+	}
 	
 	tensors = make(map[string]TensorInfo)
 	for key, msg := range rawHeader {
@@ -229,37 +223,61 @@ func initModel(this js.Value, args []js.Value) any {
 		}
 	}
 
-	// Extract Tensors into Float32 Memory
+	// Safely load layers, catching any naming changes
 	layers = make([]LlamaLayer, 30)
 	for l := 0; l < 30; l++ {
 		pfx := fmt.Sprintf("model.layers.%d.", l)
-		layers[l].norm1 = getF32(pfx + "input_layernorm.weight")
-		layers[l].wq = getF32(pfx + "self_attn.q_proj.weight")
-		layers[l].wk = getF32(pfx + "self_attn.k_proj.weight")
-		layers[l].wv = getF32(pfx + "self_attn.v_proj.weight")
-		layers[l].wo = getF32(pfx + "self_attn.o_proj.weight")
-		layers[l].norm2 = getF32(pfx + "post_attention_layernorm.weight")
-		layers[l].gate = getF32(pfx + "mlp.gate_proj.weight")
-		layers[l].up = getF32(pfx + "mlp.up_proj.weight")
-		layers[l].down = getF32(pfx + "mlp.down_proj.weight")
-	}
-	embed = getF32("model.embed_tokens.weight")
-	norm_f = getF32("model.norm.weight")
-	lm_head = getF32("lm_head.weight")
+		var err error
 
-	// Parse Vocab
+		layers[l].norm1, err = safeGetF32(pfx + "input_layernorm.weight")
+		if err != nil { return err.Error() }
+		
+		layers[l].wq, err = safeGetF32(pfx + "self_attn.q_proj.weight")
+		if err != nil { return err.Error() }
+		
+		layers[l].wk, err = safeGetF32(pfx + "self_attn.k_proj.weight")
+		if err != nil { return err.Error() }
+		
+		layers[l].wv, err = safeGetF32(pfx + "self_attn.v_proj.weight")
+		if err != nil { return err.Error() }
+		
+		layers[l].wo, err = safeGetF32(pfx + "self_attn.o_proj.weight")
+		if err != nil { return err.Error() }
+		
+		layers[l].norm2, err = safeGetF32(pfx + "post_attention_layernorm.weight")
+		if err != nil { return err.Error() }
+		
+		layers[l].gate, err = safeGetF32(pfx + "mlp.gate_proj.weight")
+		if err != nil { return err.Error() }
+		
+		layers[l].up, err = safeGetF32(pfx + "mlp.up_proj.weight")
+		if err != nil { return err.Error() }
+		
+		layers[l].down, err = safeGetF32(pfx + "mlp.down_proj.weight")
+		if err != nil { return err.Error() }
+	}
+	
+	var errEmbed, errNorm, errHead error
+	embed, errEmbed = safeGetF32("model.embed_tokens.weight")
+	norm_f, errNorm = safeGetF32("model.norm.weight")
+	lm_head, errHead = safeGetF32("lm_head.weight")
+
+	if errEmbed != nil { return errEmbed.Error() }
+	if errNorm != nil { return errNorm.Error() }
+	if errHead != nil { return errHead.Error() }
+
+	// Vocab Parse
 	json.Unmarshal([]byte(vocabStr), &vocab)
 	revVocab = make(map[int]string)
 	for k, v := range vocab { revVocab[v] = k }
 
-	// Init Cache
 	kvCache = make([]float32, 11796480)
 	isLoaded = true
 
-	return fmt.Sprintf("Inference Engine Ready! 135M params mounted.")
+	return "SmolLM2 Engine Ready. 135M params cleanly mounted."
 }
 
-// ----- TOKENIZATION & GENERATION BRIDGE -----
+// --- Bridging & Generation ---
 
 func generateText(this js.Value, args []js.Value) any {
 	prompt := args[0].String()
@@ -270,7 +288,7 @@ func generateText(this js.Value, args []js.Value) any {
 		go func() {
 			if !isLoaded { resolve.Invoke("Error: Model not loaded."); return }
 
-			// 1. Tokenize Prompt (Longest Prefix Match)
+			// Tiny BPE tokenizer fallback
 			prompt = strings.ReplaceAll(prompt, " ", "Ġ")
 			tokens := []int{}
 			for len(prompt) > 0 {
@@ -286,21 +304,17 @@ func generateText(this js.Value, args []js.Value) any {
 				prompt = prompt[bestLen:]
 			}
 
-			// 2. Process Prompt into KV Cache
+			// Pre-fill
 			next := 0
 			for i, t := range tokens { next = forward(i, t) }
 
-			// 3. Auto-regressive Generation Loop
-			for i := len(tokens); i < len(tokens)+30; i++ {
-				// Decode and stream token to JS UI
+			// Generate loop
+			for i := len(tokens); i < len(tokens)+20; i++ {
 				word := revVocab[next]
 				word = strings.ReplaceAll(word, "Ġ", " ")
-				word = strings.ReplaceAll(word, " ", " ")
 				word = strings.ReplaceAll(word, "<|im_end|>", "\n")
 				
 				js.Global().Call("appendToken", word)
-
-				// Predict next
 				next = forward(i, next)
 			}
 			resolve.Invoke("")
