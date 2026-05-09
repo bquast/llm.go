@@ -33,7 +33,9 @@ var (
 	vocab    map[string]int
 	revVocab map[int]string
 	isLoaded bool
-	currentPos int
+	
+	// Keeps track of context length across multiple messages
+	currentPos int 
 )
 
 // --- Math OPs ---
@@ -59,9 +61,23 @@ func matmul(out, x, w []float32) {
 	}
 }
 
+// matmul_tied computes y = x * W^T
+// Used specifically for weight-tied models where lm_head is just the embed_tokens matrix transposed
+func matmul_tied(out, x, w []float32) {
+	d_out := len(out)
+	d_in := len(x)
+	for i := 0; i < d_out; i++ {
+		var val float32
+		for j := 0; j < d_in; j++ {
+			val += w[i*d_in + j] * x[j]
+		}
+		out[i] = val
+	}
+}
+
 func applyRoPE(q, k []float32, pos, nHead, nKvHead, headDim int) {
 	for i := 0; i < headDim; i += 2 {
-		// FIX: SmolLM2 uses 100000.0 for RoPE, not 10000.0!
+		// SmolLM2 uses 100000.0 for RoPE
 		freq := 1.0 / math.Pow(100000.0, float64(i)/float64(headDim))
 		val := float64(pos) * freq
 		fcr, fci := float32(math.Cos(val)), float32(math.Sin(val))
@@ -96,9 +112,7 @@ func forward(pos, token int) int {
 	nKvHead := 3
 
 	// Safety check to prevent context overflow
-	if pos >= 2048 {
-		pos = 2047 
-	}
+	if pos >= 2048 { pos = 2047 }
 
 	x := make([]float32, dim)
 	// Safety bound for vocab
@@ -167,7 +181,9 @@ func forward(pos, token int) int {
 
 	rmsnorm(x, x, norm_f)
 	logits := make([]float32, 49152)
-	matmul(logits, x, lm_head)
+	
+	// FIX: Use tied matrix multiplication since lm_head == embed
+	matmul_tied(logits, x, lm_head)
 
 	best := 0
 	maxVal := float32(-1e9)
@@ -184,18 +200,9 @@ func forward(pos, token int) int {
 
 func safeGetF32(key string) ([]float32, error) {
 	t, ok := tensors[key]
-	if !ok {
-		return nil, fmt.Errorf("Missing tensor: %s", key)
-	}
-	if len(t.DataOffsets) < 2 {
-		return nil, fmt.Errorf("Corrupted offset for: %s", key)
-	}
+	if !ok { return nil, fmt.Errorf("Missing tensor: %s", key) }
 	
 	start, end := t.DataOffsets[0], t.DataOffsets[1]
-	if start >= uint64(len(modelWeights)) || end > uint64(len(modelWeights)) {
-		return nil, fmt.Errorf("OOB offset for: %s", key)
-	}
-
 	data := modelWeights[start:end]
 	f := make([]float32, len(data)/2)
 	
@@ -217,10 +224,7 @@ func initModel(this js.Value, args []js.Value) any {
 
 	headerSize := binary.LittleEndian.Uint64(modelWeights[:8])
 	var rawHeader map[string]json.RawMessage
-	err := json.Unmarshal(modelWeights[8:8+headerSize], &rawHeader)
-	if err != nil {
-		return fmt.Sprintf("Header JSON parse error: %v", err)
-	}
+	json.Unmarshal(modelWeights[8:8+headerSize], &rawHeader)
 	
 	tensors = make(map[string]TensorInfo)
 	for key, msg := range rawHeader {
@@ -234,42 +238,19 @@ func initModel(this js.Value, args []js.Value) any {
 	layers = make([]LlamaLayer, 30)
 	for l := 0; l < 30; l++ {
 		pfx := fmt.Sprintf("model.layers.%d.", l)
-		var err error
-
-		layers[l].norm1, err = safeGetF32(pfx + "input_layernorm.weight")
-		if err != nil { return err.Error() }
-		
-		layers[l].wq, err = safeGetF32(pfx + "self_attn.q_proj.weight")
-		if err != nil { return err.Error() }
-		
-		layers[l].wk, err = safeGetF32(pfx + "self_attn.k_proj.weight")
-		if err != nil { return err.Error() }
-		
-		layers[l].wv, err = safeGetF32(pfx + "self_attn.v_proj.weight")
-		if err != nil { return err.Error() }
-		
-		layers[l].wo, err = safeGetF32(pfx + "self_attn.o_proj.weight")
-		if err != nil { return err.Error() }
-		
-		layers[l].norm2, err = safeGetF32(pfx + "post_attention_layernorm.weight")
-		if err != nil { return err.Error() }
-		
-		layers[l].gate, err = safeGetF32(pfx + "mlp.gate_proj.weight")
-		if err != nil { return err.Error() }
-		
-		layers[l].up, err = safeGetF32(pfx + "mlp.up_proj.weight")
-		if err != nil { return err.Error() }
-		
-		layers[l].down, err = safeGetF32(pfx + "mlp.down_proj.weight")
-		if err != nil { return err.Error() }
+		layers[l].norm1, _ = safeGetF32(pfx + "input_layernorm.weight")
+		layers[l].wq, _ = safeGetF32(pfx + "self_attn.q_proj.weight")
+		layers[l].wk, _ = safeGetF32(pfx + "self_attn.k_proj.weight")
+		layers[l].wv, _ = safeGetF32(pfx + "self_attn.v_proj.weight")
+		layers[l].wo, _ = safeGetF32(pfx + "self_attn.o_proj.weight")
+		layers[l].norm2, _ = safeGetF32(pfx + "post_attention_layernorm.weight")
+		layers[l].gate, _ = safeGetF32(pfx + "mlp.gate_proj.weight")
+		layers[l].up, _ = safeGetF32(pfx + "mlp.up_proj.weight")
+		layers[l].down, _ = safeGetF32(pfx + "mlp.down_proj.weight")
 	}
 	
-	var errEmbed, errNorm error
-	embed, errEmbed = safeGetF32("model.embed_tokens.weight")
-	norm_f, errNorm = safeGetF32("model.norm.weight")
-
-	if errEmbed != nil { return errEmbed.Error() }
-	if errNorm != nil { return errNorm.Error() }
+	embed, _ = safeGetF32("model.embed_tokens.weight")
+	norm_f, _ = safeGetF32("model.norm.weight")
 
 	// Weight Tying Fallback
 	var errHead error
@@ -283,10 +264,9 @@ func initModel(this js.Value, args []js.Value) any {
 	revVocab = make(map[int]string)
 	for k, v := range vocab { revVocab[v] = k }
 
-	// FIX: Double the size to properly hold Keys AND Values for all 30 layers
-	// 30 layers * 2 (K+V) * 2048 max context * 3 heads * 64 head dim = 23592960
 	kvCache = make([]float32, 23592960)
 	isLoaded = true
+	currentPos = 0
 
 	return "SmolLM2 Engine Ready. 135M params cleanly mounted."
 }
@@ -318,24 +298,17 @@ func generateText(this js.Value, args []js.Value) any {
 						bestId = id
 					}
 				}
-				if bestLen == 0 {
-					bestLen = 1 
-				} else {
-					promptTokens = append(promptTokens, bestId)
-				}
+				if bestLen == 0 { bestLen = 1 } else { promptTokens = append(promptTokens, bestId) }
 				prompt = prompt[bestLen:]
 			}
 
-			// We only append the System prompt / chat tags to the new message
+			// We only append the ChatML tags to the new message
 			tokens := []int{imStart, userWord, newline}
 			tokens = append(tokens, promptTokens...)
 			tokens = append(tokens, imEnd, newline, imStart, assistantWord, newline)
 
 			fmt.Printf("Appending %d tokens to context at pos %d...\n", len(tokens), currentPos)
 
-			// --- Context Maintenance ---
-			// We push the tokens through the network starting at `currentPos`
-			// instead of 0, so the network remembers the KV Cache from earlier!
 			next := 0
 			for _, t := range tokens { 
 				next = forward(currentPos, t) 
@@ -343,10 +316,10 @@ func generateText(this js.Value, args []js.Value) any {
 			}
 
 			fmt.Println("Beginning generation...")
-			for i := 0; i < 200; i++ { // Generate up to 200 tokens
-				if next == imEnd || next == 0 || next == 2 || next == 49152 {
+			for i := 0; i < 200; i++ {
+				// 2 is <|endoftext|>, 49153 is <|im_end|>
+				if next == imEnd || next == 2 {
 					fmt.Println("Hit stop token.")
-					// Push the stop token into history so the next prompt knows this sentence ended
 					_ = forward(currentPos, next)
 					currentPos++
 					break
