@@ -33,6 +33,7 @@ var (
 	vocab    map[string]int
 	revVocab map[int]string
 	isLoaded bool
+	currentPos int
 )
 
 // --- Math OPs ---
@@ -60,7 +61,8 @@ func matmul(out, x, w []float32) {
 
 func applyRoPE(q, k []float32, pos, nHead, nKvHead, headDim int) {
 	for i := 0; i < headDim; i += 2 {
-		freq := 1.0 / math.Pow(10000.0, float64(i)/float64(headDim))
+		// FIX: SmolLM2 uses 100000.0 for RoPE, not 10000.0!
+		freq := 1.0 / math.Pow(100000.0, float64(i)/float64(headDim))
 		val := float64(pos) * freq
 		fcr, fci := float32(math.Cos(val)), float32(math.Sin(val))
 
@@ -300,14 +302,12 @@ func generateText(this js.Value, args []js.Value) any {
 		go func() {
 			if !isLoaded { resolve.Invoke("Error: Model not loaded."); return }
 
-			// SmolLM BPE IDs for ChatML formatting
 			imStart := 49152
 			imEnd := 49153
 			newline := 198
 			userWord := 4682      // "user"
 			assistantWord := 78191 // "assistant"
 
-			// --- 1. Tokenize the Prompt String ---
 			prompt = strings.ReplaceAll(prompt, " ", "Ġ")
 			promptTokens := []int{}
 			for len(prompt) > 0 {
@@ -319,48 +319,49 @@ func generateText(this js.Value, args []js.Value) any {
 					}
 				}
 				if bestLen == 0 {
-					bestLen = 1 // Skip unknown characters
+					bestLen = 1 
 				} else {
 					promptTokens = append(promptTokens, bestId)
 				}
 				prompt = prompt[bestLen:]
 			}
 
-			// --- 2. Construct the ChatML sequence ---
-			// <|im_start|> user \n
+			// We only append the System prompt / chat tags to the new message
 			tokens := []int{imStart, userWord, newline}
-			
-			// [prompt]
 			tokens = append(tokens, promptTokens...)
-			
-			// <|im_end|> \n <|im_start|> assistant \n
 			tokens = append(tokens, imEnd, newline, imStart, assistantWord, newline)
 
-			fmt.Printf("Prefilling context with %d exact ChatML tokens...\n", len(tokens))
+			fmt.Printf("Appending %d tokens to context at pos %d...\n", len(tokens), currentPos)
 
-			// --- 3. Prefill Context into the Neural Network ---
+			// --- Context Maintenance ---
+			// We push the tokens through the network starting at `currentPos`
+			// instead of 0, so the network remembers the KV Cache from earlier!
 			next := 0
-			for i, t := range tokens { next = forward(i, t) }
+			for _, t := range tokens { 
+				next = forward(currentPos, t) 
+				currentPos++
+			}
 
-			// --- 4. Generate Auto-Regressive Loop ---
 			fmt.Println("Beginning generation...")
-			for i := len(tokens); i < len(tokens)+100; i++ {
-				// Stop if model outputs End Token or hits vocab boundary
+			for i := 0; i < 200; i++ { // Generate up to 200 tokens
 				if next == imEnd || next == 0 || next == 2 || next == 49152 {
 					fmt.Println("Hit stop token.")
+					// Push the stop token into history so the next prompt knows this sentence ended
+					_ = forward(currentPos, next)
+					currentPos++
 					break
 				}
 
 				word := revVocab[next]
 				
-				// Clean the BPE formatting for the HTML UI
 				word = strings.ReplaceAll(word, "Ġ", " ")
 				word = strings.ReplaceAll(word, "Ċ", "\n")
 				word = strings.ReplaceAll(word, "<0x0A>", "\n")
 				
 				js.Global().Call("appendToken", word)
 				
-				next = forward(i, next)
+				next = forward(currentPos, next)
+				currentPos++
 			}
 			
 			resolve.Invoke("")
